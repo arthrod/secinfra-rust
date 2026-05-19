@@ -6,10 +6,11 @@ use chrono::NaiveDate;
 use futures::{Stream, StreamExt};
 use indexmap::IndexSet;
 use reqwest::Client;
-use tracing::debug;
+use tracing::{debug, info};
 
-use crate::common::{RateLimiter, Submission};
+use crate::common::{Submission, sec_user_agent};
 use crate::efts::{backfill_stream, fetch_date};
+use crate::rate_limiter::RateLimiter;
 use crate::rss::poll_rss;
 
 const MAX_ACCESSIONS: usize = 50_000;
@@ -69,7 +70,10 @@ impl Monitor {
     }
 
     pub fn build(self) -> impl Stream<Item = Vec<Submission>> {
-        assert!(self.use_rss || self.use_efts, "At least one of use_rss or use_efts must be true");
+        assert!(
+            self.use_rss || self.use_efts,
+            "At least one of use_rss or use_efts must be true"
+        );
         monitor_submissions_stream(
             self.polling_interval_ms,
             self.validation_interval_ms,
@@ -108,9 +112,21 @@ fn monitor_submissions_stream(
     use_efts: bool,
 ) -> impl Stream<Item = Vec<Submission>> {
     stream! {
+        info!(
+            polling_interval_ms,
+            validation_interval_ms,
+            start_date = ?start_date,
+            use_rss,
+            use_efts,
+            "Starting submission monitor"
+        );
+
+        let user_agent = sec_user_agent();
+        debug!(%user_agent, "Using SEC user agent");
+
         let client = Arc::new(
             Client::builder()
-                .user_agent("Mozilla/5.0")
+                .user_agent(user_agent)
                 .build()
                 .expect("Failed to build HTTP client"),
         );
@@ -122,15 +138,18 @@ fn monitor_submissions_stream(
         // Backfill
         if let Some(start) = start_date {
             let end = chrono::Utc::now().date_naive();
-            debug!(start = %start, end = %end, "Starting backfill");
-            let mut bf = backfill_stream(client.clone(), limiter.clone(), start, end);
+            info!(start = %start, end = %end, "Starting backfill");
+            let mut bf = Box::pin(backfill_stream(client.clone(), limiter.clone(), start, end));
             while let Some(batch) = bf.next().await {
+                let count = batch.len();
                 let new = filter_new(batch, &mut accessions);
+                debug!(source = "backfill", count, new = new.len(), "Filtered submissions");
                 if !new.is_empty() {
+                    info!(source = "backfill", count = new.len(), "Emitting new submissions");
                     yield new;
                 }
             }
-            debug!("Backfill complete");
+            info!("Backfill complete");
         }
 
         let poll_interval = Duration::from_millis(polling_interval_ms);
@@ -149,9 +168,11 @@ fn monitor_submissions_stream(
                 debug!(%date, "Running EFTS validation");
 
                 let results = fetch_date(&client, &limiter, date).await;
+                let count = results.len();
                 let new = filter_new(results, &mut accessions);
+                debug!(source = "efts", count, new = new.len(), "Filtered submissions");
                 if !new.is_empty() {
-                    debug!(count = new.len(), "New submissions via EFTS validation");
+                    info!(source = "efts", count = new.len(), "Emitting new submissions");
                     yield new;
                 }
 
@@ -161,11 +182,14 @@ fn monitor_submissions_stream(
 
             // RSS poll
             if use_rss && now.duration_since(last_poll) >= poll_interval {
+                debug!("Running RSS poll");
                 match poll_rss(&client, &limiter).await {
                     Ok(batch) => {
+                        let count = batch.len();
                         let new = filter_new(batch, &mut accessions);
+                        debug!(source = "rss", count, new = new.len(), "Filtered submissions");
                         if !new.is_empty() {
-                            debug!(count = new.len(), "New submissions via RSS");
+                            info!(source = "rss", count = new.len(), "Emitting new submissions");
                             yield new;
                         }
                     }

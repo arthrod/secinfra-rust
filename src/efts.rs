@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use async_stream::stream;
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Duration, NaiveDate};
 use futures::Stream;
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, error, warn};
 
-use crate::common::{RateLimiter, Submission};
+use crate::common::{Submission, SubmissionSource};
+use crate::rate_limiter::RateLimiter;
 
 const EFTS_URL: &str = "https://efts.sec.gov/LATEST/search-index";
 const MAX_PAGE_SIZE: usize = 100;
@@ -46,7 +47,11 @@ impl QueryParams {
     }
 
     fn with_date_range(&self, start: NaiveDate, end: NaiveDate) -> Self {
-        Self { start_date: start, end_date: end, ..self.clone() }
+        Self {
+            start_date: start,
+            end_date: end,
+            ..self.clone()
+        }
     }
 }
 
@@ -70,14 +75,18 @@ struct EftsSource {
 // ---------------------------------------------------------------------------
 
 fn clean_hit(hit: EftsHit) -> Option<Submission> {
-    let accession: u64 = hit.source.adsh
+    let accession: u64 = hit
+        .source
+        .adsh
         .chars()
         .filter(|c| c.is_ascii_digit())
         .collect::<String>()
         .parse()
         .ok()?;
 
-    let ciks: Vec<u64> = hit.source.ciks
+    let ciks: Vec<u64> = hit
+        .source
+        .ciks
         .iter()
         .filter_map(|c| c.parse::<u64>().ok())
         .collect();
@@ -87,6 +96,8 @@ fn clean_hit(hit: EftsHit) -> Option<Submission> {
         submission_type: hit.source.file_type,
         ciks,
         filing_date: hit.source.file_date,
+        source: SubmissionSource::Efts,
+        detected_time: chrono::Utc::now(),
     })
 }
 
@@ -123,15 +134,46 @@ async fn fetch_total(
     query.push(("size", "1".to_string()));
 
     limiter.acquire().await;
-    let resp = client.get(EFTS_URL).query(&query).send().await
+    debug!(
+        start = %params.start_date,
+        end = %params.end_date,
+        "Probing EFTS total"
+    );
+    let resp = client
+        .get(EFTS_URL)
+        .query(&query)
+        .send()
+        .await
         .map_err(|e| error!("EFTS probe failed: {e}"))
         .ok()?;
 
-    let json: serde_json::Value = resp.json().await
+    let status = resp.status();
+    if !status.is_success() {
+        error!(
+            %status,
+            start = %params.start_date,
+            end = %params.end_date,
+            "EFTS probe returned non-success status"
+        );
+        return None;
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| error!("EFTS probe parse failed: {e}"))
         .ok()?;
 
-    json["hits"]["total"]["value"].as_u64().map(|n| n as usize)
+    let total = json["hits"]["total"]["value"].as_u64().map(|n| n as usize);
+    if let Some(total) = total {
+        debug!(
+            total,
+            start = %params.start_date,
+            end = %params.end_date,
+            "EFTS total"
+        );
+    }
+    total
 }
 
 async fn fetch_page(
@@ -145,24 +187,59 @@ async fn fetch_page(
     query.push(("size", MAX_PAGE_SIZE.to_string()));
 
     limiter.acquire().await;
+    debug!(
+        from,
+        size = MAX_PAGE_SIZE,
+        start = %params.start_date,
+        end = %params.end_date,
+        "Fetching EFTS page"
+    );
     let resp = match client.get(EFTS_URL).query(&query).send().await {
         Ok(r) => r,
-        Err(e) => { error!("EFTS fetch failed: {e}"); return vec![]; }
+        Err(e) => {
+            error!("EFTS fetch failed: {e}");
+            return vec![];
+        }
     };
+
+    let status = resp.status();
+    if !status.is_success() {
+        error!(
+            %status,
+            from,
+            size = MAX_PAGE_SIZE,
+            start = %params.start_date,
+            end = %params.end_date,
+            "EFTS page returned non-success status"
+        );
+        return vec![];
+    }
 
     let json: serde_json::Value = match resp.json().await {
         Ok(j) => j,
-        Err(e) => { error!("EFTS parse failed: {e}"); return vec![]; }
+        Err(e) => {
+            error!("EFTS parse failed: {e}");
+            return vec![];
+        }
     };
 
-    json["hits"]["hits"]
+    let results: Vec<Submission> = json["hits"]["hits"]
         .as_array()
         .cloned()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|h| serde_json::from_value::<EftsHit>(h).ok())
         .filter_map(clean_hit)
-        .collect()
+        .collect();
+
+    debug!(
+        from,
+        count = results.len(),
+        start = %params.start_date,
+        end = %params.end_date,
+        "Fetched EFTS page"
+    );
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +289,14 @@ async fn fetch_recursive(
     }
 
     let ranges = split_date_range(params.start_date, params.end_date, 4);
+    debug!(
+        total,
+        depth,
+        start = %params.start_date,
+        end = %params.end_date,
+        chunks = ranges.len(),
+        "Splitting oversized EFTS range"
+    );
     let mut results = vec![];
     for (start, end) in ranges {
         let mut sub = fetch_recursive(
@@ -219,7 +304,8 @@ async fn fetch_recursive(
             limiter,
             params.with_date_range(start, end),
             depth + 1,
-        ).await;
+        )
+        .await;
         results.append(&mut sub);
     }
     results
@@ -236,9 +322,15 @@ pub async fn fetch_date(
     limiter: &RateLimiter,
     date: NaiveDate,
 ) -> Vec<Submission> {
-    let params = QueryParams { ciks: vec![], start_date: date, end_date: date };
+    let params = QueryParams {
+        ciks: vec![],
+        start_date: date,
+        end_date: date,
+    };
     debug!(%date, "EFTS fetch_date");
-    fetch_recursive(client, limiter, params, 0).await
+    let results = fetch_recursive(client, limiter, params, 0).await;
+    debug!(%date, count = results.len(), "EFTS fetch_date complete");
+    results
 }
 
 /// Stream all primary document submissions between two dates.
@@ -253,6 +345,12 @@ pub fn backfill_stream(
         let params = QueryParams { ciks: vec![], start_date, end_date };
         debug!(start = %start_date, end = %end_date, "Starting EFTS backfill");
         let results = fetch_recursive(&client, &limiter, params, 0).await;
+        debug!(
+            start = %start_date,
+            end = %end_date,
+            count = results.len(),
+            "EFTS backfill complete"
+        );
         if !results.is_empty() {
             yield results;
         }

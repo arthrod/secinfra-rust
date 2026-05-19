@@ -21,6 +21,7 @@ pub fn format_accession_int(n: u64, fmt: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn detect_format(s: &str) -> &str {
     if s.contains('-') { "dash" } else { "nodash" }
 }

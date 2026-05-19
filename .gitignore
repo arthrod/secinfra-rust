@@ -1,0 +1,19 @@
+/target/
+Cargo.lock
+
+# Local environment
+.env
+.env.*
+
+# Logs
+*.log
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.bak

@@ -1,3 +1,3 @@
-rss.rs
+# secinfra
 
-finish efts and monitor.rss helper func.
+A package to work with SEC data. Rust rewrite of [datamule-python](https://github.com/john-friedman/datamule-python).
