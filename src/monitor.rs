@@ -8,7 +8,7 @@ use indexmap::IndexSet;
 use reqwest::Client;
 use tracing::{debug, info};
 
-use crate::common::{Submission, sec_user_agent};
+use crate::common::{sec_filing_date_now, sec_user_agent, Submission};
 use crate::efts::{backfill_stream, fetch_date};
 use crate::rate_limiter::RateLimiter;
 use crate::rss::poll_rss;
@@ -137,7 +137,7 @@ fn monitor_submissions_stream(
 
         // Backfill
         if let Some(start) = start_date {
-            let end = chrono::Utc::now().date_naive();
+            let end = sec_filing_date_now();
             info!(start = %start, end = %end, "Starting backfill");
             let mut bf = Box::pin(backfill_stream(client.clone(), limiter.clone(), start, end));
             while let Some(batch) = bf.next().await {
@@ -164,7 +164,7 @@ fn monitor_submissions_stream(
 
             // EFTS validation takes priority when due — RSS pauses until complete
             if use_efts && now.duration_since(last_val) >= val_interval {
-                let date = chrono::Utc::now().date_naive();
+                let date = sec_filing_date_now();
                 debug!(%date, "Running EFTS validation");
 
                 let results = fetch_date(&client, &limiter, date).await;
