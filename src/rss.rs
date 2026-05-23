@@ -14,6 +14,39 @@ fn xml_preview(xml: &str) -> String {
     String::from_utf8_lossy(&xml.as_bytes()[..xml.len().min(1000)]).into_owned()
 }
 
+fn push_or_merge_submission(
+    submissions: &mut Vec<Submission>,
+    accession: u64,
+    cik: Option<u64>,
+    submission_type: &str,
+    filing_date: &str,
+    detected_time: &chrono::DateTime<chrono::Utc>,
+) {
+    if let Some(existing) = submissions.iter_mut().find(|s| s.accession == accession) {
+        if let Some(cik) = cik {
+            if !existing.ciks.contains(&cik) {
+                existing.ciks.push(cik);
+            }
+        }
+        if existing.submission_type.is_empty() && !submission_type.is_empty() {
+            existing.submission_type = submission_type.to_string();
+        }
+        if existing.filing_date.is_empty() && !filing_date.is_empty() {
+            existing.filing_date = filing_date.to_string();
+        }
+        return;
+    }
+
+    submissions.push(Submission {
+        accession,
+        submission_type: submission_type.to_string(),
+        ciks: cik.into_iter().collect(),
+        filing_date: filing_date.to_string(),
+        source: SubmissionSource::Rss,
+        detected_time: detected_time.clone(),
+    });
+}
+
 fn parse_rss(xml: &str) -> Vec<Submission> {
     let mut submissions = Vec::new();
     let detected_time = chrono::Utc::now();
@@ -80,14 +113,14 @@ fn parse_rss(xml: &str) -> Vec<Submission> {
                     }
                     b"entry" => {
                         if let Some(accession) = current_accession {
-                            submissions.push(Submission {
+                            push_or_merge_submission(
+                                &mut submissions,
                                 accession,
-                                submission_type: current_type.clone(),
-                                ciks: current_cik.into_iter().collect(),
-                                filing_date: current_date.clone(),
-                                source: SubmissionSource::Rss,
-                                detected_time,
-                            });
+                                current_cik,
+                                &current_type,
+                                &current_date,
+                                &detected_time,
+                            );
                         } else {
                             debug!("Skipping RSS entry without accession");
                         }
