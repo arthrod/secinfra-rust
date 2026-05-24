@@ -36,6 +36,7 @@ pub async fn compress_bytes_async(
 pub async fn compress_byte_stream_async<S, E>(
     compression_type: CompressionType,
     level: i32,
+    threads: Option<u32>,
     stream: S,
 ) -> anyhow::Result<CompressedBytes>
 where
@@ -47,6 +48,9 @@ where
         match compression_type {
             CompressionType::Zstd => {
                 let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level)?;
+                if let Some(threads) = threads {
+                    encoder.multithread(threads)?;
+                }
                 while let Some(chunk) = rx.blocking_recv() {
                     encoder.write_all(&chunk)?;
                 }
