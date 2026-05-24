@@ -1,0 +1,1 @@
+RSS displays filings with multiple ciks as one item per cik. This leads to odd behavior for old filings on the first page, as their cik may be on the second.
