@@ -9,7 +9,10 @@ mod rss;
 
 pub use common::{sec_filing_date_now, Submission, SubmissionSource};
 pub use common::sec_user_agent;
-pub use compression_util::{compress_bytes, compress_bytes_async, CompressionType};
+pub use compression_util::{
+    compress_byte_stream_async, compress_bytes, compress_bytes_async, CompressedBytes,
+    CompressionType,
+};
 pub use construct_urls::{
     construct_document_url, construct_folder_url, construct_index_url, construct_sgml_url,
 };
