@@ -6,6 +6,7 @@ use chrono::NaiveDate;
 use futures::{Stream, StreamExt};
 use indexmap::IndexSet;
 use reqwest::Client;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::common::{sec_filing_date_now, sec_user_agent, Submission};
@@ -14,6 +15,65 @@ use crate::rate_limiter::RateLimiter;
 use crate::rss::poll_rss;
 
 const MAX_ACCESSIONS: usize = 50_000;
+
+#[derive(Clone)]
+pub struct AccessionCache {
+    accessions: Arc<Mutex<IndexSet<u64>>>,
+    max_accessions: usize,
+}
+
+impl Default for AccessionCache {
+    fn default() -> Self {
+        Self::new(MAX_ACCESSIONS)
+    }
+}
+
+impl AccessionCache {
+    pub fn new(max_accessions: usize) -> Self {
+        Self {
+            accessions: Arc::new(Mutex::new(IndexSet::with_capacity(max_accessions))),
+            max_accessions,
+        }
+    }
+
+    pub async fn check_and_insert(&self, accession: u64) -> bool {
+        if self.max_accessions == 0 {
+            return false;
+        }
+
+        let mut accessions = self.accessions.lock().await;
+        if accessions.contains(&accession) {
+            return false;
+        }
+        if accessions.len() >= self.max_accessions {
+            accessions.shift_remove_index(0);
+        }
+        accessions.insert(accession);
+        true
+    }
+
+    pub async fn filter_new(&self, batch: Vec<Submission>) -> Vec<Submission> {
+        if self.max_accessions == 0 {
+            return Vec::new();
+        }
+
+        let mut new = Vec::new();
+        let mut accessions = self.accessions.lock().await;
+
+        for submission in batch {
+            if accessions.contains(&submission.accession) {
+                continue;
+            }
+            if accessions.len() >= self.max_accessions {
+                accessions.shift_remove_index(0);
+            }
+            accessions.insert(submission.accession);
+            new.push(submission);
+        }
+
+        new
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -25,6 +85,7 @@ pub struct Monitor {
     start_date: Option<NaiveDate>,
     use_rss: bool,
     use_efts: bool,
+    accession_cache: Option<AccessionCache>,
 }
 
 impl Default for Monitor {
@@ -35,6 +96,7 @@ impl Default for Monitor {
             start_date: None,
             use_rss: true,
             use_efts: true,
+            accession_cache: None,
         }
     }
 }
@@ -69,17 +131,24 @@ impl Monitor {
         self
     }
 
+    pub fn with_cache(mut self, cache: AccessionCache) -> Self {
+        self.accession_cache = Some(cache);
+        self
+    }
+
     pub fn build(self) -> impl Stream<Item = Vec<Submission>> {
         assert!(
             self.use_rss || self.use_efts,
             "At least one of use_rss or use_efts must be true"
         );
+        let accession_cache = self.accession_cache.unwrap_or_default();
         monitor_submissions_stream(
             self.polling_interval_ms,
             self.validation_interval_ms,
             self.start_date,
             self.use_rss,
             self.use_efts,
+            accession_cache,
         )
     }
 }
@@ -88,28 +157,13 @@ impl Monitor {
 // Internals
 // ---------------------------------------------------------------------------
 
-fn filter_new(batch: Vec<Submission>, accessions: &mut IndexSet<u64>) -> Vec<Submission> {
-    batch
-        .into_iter()
-        .filter(|s| {
-            if accessions.contains(&s.accession) {
-                return false;
-            }
-            if accessions.len() == MAX_ACCESSIONS {
-                accessions.shift_remove_index(0);
-            }
-            accessions.insert(s.accession);
-            true
-        })
-        .collect()
-}
-
 fn monitor_submissions_stream(
     polling_interval_ms: u64,
     validation_interval_ms: u64,
     start_date: Option<NaiveDate>,
     use_rss: bool,
     use_efts: bool,
+    accession_cache: AccessionCache,
 ) -> impl Stream<Item = Vec<Submission>> {
     stream! {
         info!(
@@ -133,8 +187,6 @@ fn monitor_submissions_stream(
 
         let limiter = Arc::new(RateLimiter::new(polling_interval_ms));
 
-        let mut accessions: IndexSet<u64> = IndexSet::with_capacity(MAX_ACCESSIONS);
-
         // Backfill
         if let Some(start) = start_date {
             let end = sec_filing_date_now();
@@ -142,7 +194,7 @@ fn monitor_submissions_stream(
             let mut bf = Box::pin(backfill_stream(client.clone(), limiter.clone(), start, end));
             while let Some(batch) = bf.next().await {
                 let count = batch.len();
-                let new = filter_new(batch, &mut accessions);
+                let new = accession_cache.filter_new(batch).await;
                 debug!(source = "backfill", count, new = new.len(), "Filtered submissions");
                 if !new.is_empty() {
                     info!(source = "backfill", count = new.len(), "Emitting new submissions");
@@ -169,7 +221,7 @@ fn monitor_submissions_stream(
 
                 let results = fetch_date(&client, &limiter, date).await;
                 let count = results.len();
-                let new = filter_new(results, &mut accessions);
+                let new = accession_cache.filter_new(results).await;
                 debug!(source = "efts", count, new = new.len(), "Filtered submissions");
                 if !new.is_empty() {
                     info!(source = "efts", count = new.len(), "Emitting new submissions");
@@ -186,7 +238,7 @@ fn monitor_submissions_stream(
                 match poll_rss(&client, &limiter).await {
                     Ok(batch) => {
                         let count = batch.len();
-                        let new = filter_new(batch, &mut accessions);
+                        let new = accession_cache.filter_new(batch).await;
                         debug!(source = "rss", count, new = new.len(), "Filtered submissions");
                         if !new.is_empty() {
                             info!(source = "rss", count = new.len(), "Emitting new submissions");
