@@ -14,6 +14,8 @@ pub struct Submission {
     pub submission_type: String,
     pub ciks: Vec<u64>,
     pub filing_date: String,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
     pub source: SubmissionSource,
     pub detected_time: DateTime<Utc>,
 }

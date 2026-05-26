@@ -96,6 +96,7 @@ fn clean_hit(hit: EftsHit) -> Option<Submission> {
         submission_type: hit.source.file_type,
         ciks,
         filing_date: hit.source.file_date,
+        size_bytes: None,
         source: SubmissionSource::Efts,
         detected_time: chrono::Utc::now(),
     })
