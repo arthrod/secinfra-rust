@@ -9,7 +9,7 @@ use reqwest::Client;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::common::{sec_filing_date_now, sec_user_agent, Submission};
+use crate::common::{Submission, sec_filing_date_now, sec_user_agent};
 use crate::efts::{backfill_stream, fetch_date};
 use crate::rate_limiter::RateLimiter;
 use crate::rss::poll_rss;

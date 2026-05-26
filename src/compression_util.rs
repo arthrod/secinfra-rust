@@ -247,11 +247,9 @@ impl Write for ChannelWriter {
             let rest = self.buffer.split_off(self.chunk_size);
             let chunk = std::mem::replace(&mut self.buffer, rest);
             self.compressed_bytes += chunk.len();
-            self.tx
-                .blocking_send(Ok(Bytes::from(chunk)))
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "compressed stream closed")
-                })?;
+            self.tx.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "compressed stream closed")
+            })?;
         }
 
         Ok(buf.len())
